@@ -2,6 +2,7 @@ package calls
 
 import (
 	"fmt"
+	"math/big"
 
 	"github.com/crytic/medusa/chain"
 	"github.com/crytic/medusa/fuzzing/contracts"
@@ -51,97 +52,44 @@ func ExecuteCallSequenceIteratively(chain *chain.TestChain, fetchElementFunc Exe
 			break
 		}
 
-		// We try to add the transaction with our call more than once. If the pending block is too full, we may hit a
-		// block gas limit, which we handle by committing the pending block without this tx, and creating a new pending
-		// block that is empty to try adding this tx there instead.
-		// If we encounter an error on an empty block, we throw the error as there is nothing more we can do.
-		for {
-			// If we have a pending block, but we intend to delay this call from the last, we commit that block.
-			if chain.PendingBlock() != nil && callSequenceElement.BlockNumberDelay > 0 {
-				err := chain.PendingBlockCommit()
-				if err != nil {
-					return callSequenceExecuted, err
-				}
-			}
+		// Process contract setup hook if present
+		err = executeContractSetupHook(chain, callSequenceElement, &callSequenceExecuted)
+		if err != nil {
+			return callSequenceExecuted, err
+		}
 
-			// If we have no pending block to add a tx containing our call to, we must create one.
-			if chain.PendingBlock() == nil {
-				// The minimum step between blocks must be 1 in block number and timestamp, so we ensure this is the
-				// case.
-				numberDelay := callSequenceElement.BlockNumberDelay
-				timeDelay := callSequenceElement.BlockTimestampDelay
-				if numberDelay == 0 {
-					numberDelay = 1
-				}
-				if timeDelay == 0 {
-					timeDelay = 1
-				}
+		// Add transaction to pending block
+		err = addTxToPendingBlock(chain, callSequenceElement.BlockNumberDelay, callSequenceElement.BlockTimestampDelay, callSequenceElement.Call, additionalTracers...)
+		if err != nil {
+			return callSequenceExecuted, err
+		}
 
-				// Each timestamp/block number must be unique as well, so we cannot jump more block numbers than time.
-				if numberDelay > timeDelay {
-					numberDelay = timeDelay
-				}
-				_, err := chain.PendingBlockCreateWithParameters(chain.Head().Header.Number.Uint64()+numberDelay, chain.Head().Header.Time+timeDelay, nil)
-				if err != nil {
-					return callSequenceExecuted, err
-				}
-			}
+		// Update our chain reference for this element.
+		callSequenceElement.ChainReference = &CallSequenceElementChainReference{
+			Block:            chain.PendingBlock(),
+			TransactionIndex: len(chain.PendingBlock().Messages) - 1,
+		}
 
-			// Try to add our transaction to this block.
-			err = chain.PendingBlockAddTx(callSequenceElement.Call.ToCoreMessage(), additionalTracers...)
+		// Add to our executed call sequence
+		callSequenceExecuted = append(callSequenceExecuted, callSequenceElement)
 
+		// We added our call to the block as a transaction. Call our step function with the update and check
+		// if it returned an error.
+		if executionCheckFunc != nil {
+			execCheckFuncRequestedBreak, err = executionCheckFunc(callSequenceExecuted)
 			if err != nil {
-				// If we encountered a block gas limit error, this tx is too expensive to fit in this block.
-				// If there are other transactions in the block, this makes sense. The block is "full".
-				// In that case, we commit the pending block without this tx, and create a new pending block to add
-				// our tx to, and iterate to try and add it again.
-				// TODO: This should also check the condition that this is a block gas error specifically. For now, we
-				//  simply assume it is and try processing in an empty block (if that fails, that error will be
-				//  returned).
-				if len(chain.PendingBlock().Messages) > 0 {
-					err := chain.PendingBlockCommit()
-					if err != nil {
-						return callSequenceExecuted, err
-					}
-					continue
-				}
-
-				// If there are no transactions in our block, and we failed to add this one, return the error
 				return callSequenceExecuted, err
 			}
 
-			// Update our chain reference for this element.
-			callSequenceElement.ChainReference = &CallSequenceElementChainReference{
-				Block:            chain.PendingBlock(),
-				TransactionIndex: len(chain.PendingBlock().Messages) - 1,
+			// If post-execution check requested we break execution, break out of our "retry loop"
+			if execCheckFuncRequestedBreak {
+				break
 			}
-
-			// Add to our executed call sequence
-			callSequenceExecuted = append(callSequenceExecuted, callSequenceElement)
-
-			// We added our call to the block as a transaction. Call our step function with the update and check
-			// if it returned an error.
-			if executionCheckFunc != nil {
-				execCheckFuncRequestedBreak, err = executionCheckFunc(callSequenceExecuted)
-				if err != nil {
-					return callSequenceExecuted, err
-				}
-
-				// If post-execution check requested we break execution, break out of our "retry loop"
-				if execCheckFuncRequestedBreak {
-					break
-				}
-			}
-
-			// We didn't encounter an error, so we were successful in adding this transaction. Break out of this
-			// inner "retry loop" and move onto processing the next element in the outer loop.
-			break
 		}
 
-		// If post-execution check requested we break execution, break out of our "execute next call sequence loop"
-		if execCheckFuncRequestedBreak {
-			break
-		}
+		// We didn't encounter an error, so we were successful in adding this transaction. Break out of this
+		// inner "retry loop" and move onto processing the next element in the outer loop.
+		break
 	}
 
 	// Commit the last pending block.
@@ -201,4 +149,94 @@ func ExecuteCallSequenceWithExecutionTracer(testChain *chain.TestChain, contract
 	}
 
 	return executedCallSeq, err
+}
+
+// executeContractSetupHook processes the contract setup hook for the call sequence element, if exists.
+func executeContractSetupHook(chain *chain.TestChain, callSequenceElement *CallSequenceElement, callSequenceExecuted *CallSequence) error {
+	if callSequenceElement.Contract == nil || callSequenceElement.Contract.SetupHook == nil {
+		return nil
+	}
+
+	// Get contract setup hook
+	contractSetupHook := callSequenceElement.Contract.SetupHook
+
+	// Create a call targeting contract setup hook
+	msg := NewCallMessageWithAbiValueData(contractSetupHook.DeployerAddress, callSequenceElement.Call.To, 0, big.NewInt(0), callSequenceElement.Call.GasLimit, nil, nil, nil, &CallMessageDataAbiValues{
+		Method:      contractSetupHook.Method,
+		InputValues: nil,
+	})
+
+	// Execute the call
+	// If we have no pending block to add a tx containing our call to, we must create one.
+	err := addTxToPendingBlock(chain, callSequenceElement.BlockNumberDelay, callSequenceElement.BlockTimestampDelay, msg)
+	if err != nil {
+		return err
+	}
+
+	setupCallSequenceElement := NewCallSequenceElement(callSequenceElement.Contract, msg, callSequenceElement.BlockNumberDelay, callSequenceElement.BlockTimestampDelay)
+	setupCallSequenceElement.ChainReference = &CallSequenceElementChainReference{
+		Block:            chain.PendingBlock(),
+		TransactionIndex: len(chain.PendingBlock().Messages) - 1,
+	}
+
+	// Register the call in our call sequence so it gets registered in coverage.
+	*callSequenceExecuted = append(*callSequenceExecuted, setupCallSequenceElement)
+	return nil
+}
+
+// addTxToPendingBlock ensures a transaction is added to a pending block, creating a new block if necessary.
+// It handles block delays and retries if the block is full.
+func addTxToPendingBlock(chain *chain.TestChain, blockNumberDelay uint64, blockTimestampDelay uint64, msg *CallMessage, additionalTracers ...*chain.TestChainTracer) error {
+	for {
+		msg.FillFromTestChainProperties(chain)
+
+		// If we have a pending block, but we intend to delay this call from the last, we commit that block.
+		if chain.PendingBlock() != nil && blockNumberDelay > 0 {
+			err := chain.PendingBlockCommit()
+			if err != nil {
+				return err
+			}
+		}
+
+		// If we have no pending block to add a tx containing our call to, we must create one.
+		if chain.PendingBlock() == nil {
+			// The minimum step between blocks must be 1 in block number and timestamp, so we ensure this is the case.
+			numberDelay := blockNumberDelay
+			timeDelay := blockTimestampDelay
+			if numberDelay == 0 {
+				numberDelay = 1
+			}
+			if timeDelay == 0 {
+				timeDelay = 1
+			}
+
+			// Each timestamp/block number must be unique as well, so we cannot jump more block numbers than time.
+			if numberDelay > timeDelay {
+				numberDelay = timeDelay
+			}
+			_, err := chain.PendingBlockCreateWithParameters(chain.Head().Header.Number.Uint64()+numberDelay, chain.Head().Header.Time+timeDelay, nil)
+			if err != nil {
+				return err
+			}
+		}
+
+		// Try to add our transaction to this block.
+		err := chain.PendingBlockAddTx(msg.ToCoreMessage(), additionalTracers...)
+
+		if err != nil {
+			// If we encountered a block gas limit error and there are other transactions in the block,
+			// commit the pending block and try again in a new block.
+			if len(chain.PendingBlock().Messages) > 0 {
+				err := chain.PendingBlockCommit()
+				if err != nil {
+					return err
+				}
+				continue
+			}
+			// If there are no transactions in our block, and we failed to add this one, return the error
+			return err
+		}
+
+		return nil
+	}
 }
