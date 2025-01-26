@@ -4,6 +4,8 @@ import (
 	"crypto/ecdsa"
 	"encoding/hex"
 	"fmt"
+	"github.com/crytic/medusa/compilation/abiutils"
+	"github.com/crytic/medusa/logging"
 	"math/big"
 	"os/exec"
 	"strconv"
@@ -277,6 +279,124 @@ func getStandardCheatCodeContract(tracer *cheatCodeTracer) (*CheatCodeContract, 
 			cheatCodeCallerFrame.onFrameExitRestoreHooks.Push(func() {
 				scopeContext.Contract.CallerAddress = original
 			})
+			return nil, nil
+		},
+	)
+
+	// expectRevert(): If the next non-cheatcode call does not revert, then expectRevert will
+	contract.addMethod(
+		"expectRevert", abi.Arguments{}, abi.Arguments{},
+		func(tracer *cheatCodeTracer, inputs []any) ([]any, *cheatCodeRawReturnData) {
+			cheatCodeCallerFrame := tracer.PreviousCallFrame()
+
+			// Initialize a sub logger
+			logger := logging.GlobalLogger.NewSubLogger("module", "cheatcodes")
+
+			// Initialize a flag to know whether there was a callframe after the current one
+			enteredNewCallframe := false
+
+			var expectRevertHook func()
+			expectRevertHook = func() {
+				// We entered the scope we expect to revert, obtain a reference to the call frame
+				revertCallFrame := tracer.CurrentCallFrame()
+
+				// if current call frame is a cheatcode, propagate hook to next callframe
+				if revertCallFrame.vmScope == nil {
+					cheatCodeCallerFrame.onNextFrameExitRestoreHooks.Push(expectRevertHook)
+					return
+				}
+
+				// Update flag if not already updated to indicate that a new callframe was entered
+				if !enteredNewCallframe {
+					enteredNewCallframe = true
+				}
+
+				if revertCallFrame.vmOp == vm.REVERT {
+					// got expected revert, erase error and proceed
+					tracer.results.executionResult.Err = nil
+					tracer.results.executionResult.ReturnData = nil
+				} else {
+					logger.Error("expectRevert: Expected a revert but got none")
+					tracer.ThrowAssertionError()
+				}
+			}
+
+			cheatCodeCallerFrame.onNextFrameExitRestoreHooks.Push(expectRevertHook)
+
+			// ensure the revert hook was executed
+			cheatCodeCallerFrame.onTopFrameExitRestoreHooks.Push(func() {
+				if !enteredNewCallframe {
+					logger.Error("expectRevert: Expected a revert but got none")
+					tracer.ThrowAssertionError()
+				}
+			})
+
+			return nil, nil
+		},
+	)
+
+	// expectRevert(string): If the next non-cheatcode call does not revert with the expected revert message, then expectRevert will
+	contract.addMethod(
+		"expectRevert", abi.Arguments{{Type: typeString}}, abi.Arguments{},
+		func(tracer *cheatCodeTracer, inputs []any) ([]any, *cheatCodeRawReturnData) {
+			// Obtain the caller frame. This is a pre-compile, so we want to add an event to the frame which called us,
+			// so when it enters the next frame in its scope, we trigger expectRevert
+			cheatCodeCallerFrame := tracer.PreviousCallFrame()
+
+			// Initialize a sub logger
+			logger := logging.GlobalLogger.NewSubLogger("module", "cheatcodes")
+
+			// Initialize a flag to know whether there was a callframe after the current one
+			enteredNewCallframe := false
+
+			var expectRevertHook func()
+			expectRevertHook = func() {
+				// We entered the scope we expect to revert, obtain a reference to the call frame
+				revertCallFrame := tracer.CurrentCallFrame()
+
+				// if current call frame is a cheatcode, propagate hook to next callframe
+				if revertCallFrame.vmScope == nil {
+					cheatCodeCallerFrame.onNextFrameExitRestoreHooks.Push(expectRevertHook)
+					return
+				}
+
+				// Update flag if not already updated to indicate that a new callframe was entered
+				if !enteredNewCallframe {
+					enteredNewCallframe = true
+				}
+
+				// Get the revert error string
+				revertString := abiutils.GetSolidityRevertErrorString(revertCallFrame.vmErr, revertCallFrame.vmReturnData)
+
+				// Get the provided expected error string
+				expectedRevertString := inputs[0].(string)
+
+				// Check that the call reverted and that an error string present to the provided error string was supplied
+				if revertCallFrame.vmOp == vm.REVERT && revertString != nil && expectedRevertString == *revertString {
+					// got expected revert, clear out error and proceed
+					tracer.results.executionResult.Err = nil
+					tracer.results.executionResult.ReturnData = nil
+				} else {
+					if revertCallFrame.vmOp != vm.REVERT {
+						logger.Error("expectRevert: Expected a revert but got none")
+					} else {
+						logger.Error("expectRevert: Revert error string did not match expected error string")
+					}
+
+					tracer.ThrowAssertionError()
+				}
+			}
+
+			cheatCodeCallerFrame.onNextFrameExitRestoreHooks.Push(expectRevertHook)
+
+			// ensure the revert hook was executed
+			cheatCodeCallerFrame.onTopFrameExitRestoreHooks.Push(func() {
+				if !enteredNewCallframe {
+					logger.Error("expectRevert: Expected a revert but got none")
+					tracer.ThrowAssertionError()
+				}
+			})
+
 			return nil, nil
 		},
 	)
