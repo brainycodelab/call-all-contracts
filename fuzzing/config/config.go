@@ -210,6 +210,9 @@ type PanicCodeConfig struct {
 	// FailOnCompilerInsertedPanic describes whether a generic compiler inserted panic should be treated as a failing case
 	FailOnCompilerInsertedPanic bool `json:"failOnCompilerInsertedPanic"`
 
+	// FailOnRevert describes whether an EVM revert should be treated as a failing case
+	FailOnRevert bool `json:"failOnRevert"`
+
 	// FailOnAssertion describes whether an assertion failure should be treated as a failing case
 	FailOnAssertion bool `json:"failOnAssertion"`
 
